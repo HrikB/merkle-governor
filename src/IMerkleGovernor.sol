@@ -9,6 +9,7 @@ import { IERC6372 } from "@openzeppelin/contracts/interfaces/IERC6372.sol";
  */
 interface IMerkleGovernor is IERC165, IERC6372 {
     enum ProposalState {
+        AwaitingValidation,
         Pending,
         Active,
         Canceled,
@@ -48,6 +49,21 @@ interface IMerkleGovernor is IERC165, IERC6372 {
      * @dev The `proposalId` doesn't exist.
      */
     error GovernorNonexistentProposal(uint256 proposalId);
+
+    /**
+     * @dev Only `_proposalValidator` can validate a proposal.
+     */
+    error GovernorOnlyProposalValidator(address sender);
+
+    /**
+     * @dev The necessary checkpoint root has not yet been approved.
+     */
+    error GovernorCheckpointNotYetApproved();
+
+    /**
+     * @dev Proof failed to be verified.
+     */
+    error GovernorInvalidVoterProof(address voter, uint256 votingPower);
 
     /**
      * @dev The current state of a proposal is not the required for performing an operation.
@@ -105,17 +121,21 @@ interface IMerkleGovernor is IERC165, IERC6372 {
     /**
      * @dev Emitted when a proposal is created.
      */
-    event ProposalCreated(
+    event ProposalRequested(
         uint256 proposalId,
         address proposer,
         address[] targets,
         uint256[] values,
         string[] signatures,
         bytes[] calldatas,
-        uint256 voteStart,
-        uint256 voteEnd,
+        uint256 voteSnapshot,
         string description
     );
+
+    /**
+     * @dev Emitted when a proposal is validated.
+     */
+    event ProposalValidated(uint256 proposalId);
 
     /**
      * @dev Emitted when a proposal is queued.
@@ -224,6 +244,11 @@ interface IMerkleGovernor is IERC165, IERC6372 {
      * @notice module:core
      * @dev Timepoint at which votes close. If using block number, votes close at the end of this block, so it is
      * possible to cast a vote during this block.
+     *
+     * The deadline is calculated dynamically based on when the voter snapshot
+     * root was approved in the oracle. Since it would be impossible to
+     * calculate the deadline in advance, this functions returns 0 until the
+     * approval has been made.
      */
     function proposalDeadline(uint256 proposalId) external view returns (uint256);
 
@@ -249,24 +274,24 @@ interface IMerkleGovernor is IERC165, IERC6372 {
 
     /**
      * @notice module:user-config
-     * @dev Delay, between the proposal is created and the vote starts. The unit this duration is expressed in depends
-     * on the clock (see EIP-6372) this contract uses.
+     * @dev Delay, between when the proposal is created and when the snapshot
+     * for eligible voters is taken. The unit this duration is expressed in
+     * depends on the clock (see EIP-6372) this contract uses.
      *
-     * This can be increased to leave time for users to buy voting power, or delegate it, before the voting of a
-     * proposal starts.
+     * This can be increased to leave time for users to buy voting power, or
+     * delegate it, before the voting of a proposal starts.
      *
-     * NOTE: While this interface returns a uint256, timepoints are stored as uint48 following the ERC-6372 clock type.
-     * Consequently this value must fit in a uint48 (when added to the current clock). See {IERC6372-clock}.
+     * NOTE: While this interface returns a uint256, timepoints are stored as
+     * uint48 following the ERC-6372 clock type. Consequently this value must
+     * fit in a uint48 (when added to the current clock). See {IERC6372-clock}.
      */
-    function votingDelay() external view returns (uint256);
+    function snapshotDelay() external view returns (uint256);
 
     /**
      * @notice module:user-config
      * @dev Delay between the vote start and vote end. The unit this duration is expressed in depends on the clock
      * (see EIP-6372) this contract uses.
      *
-     * NOTE: The {votingDelay} can delay the start of the vote. This must be considered when setting the voting
-     * duration compared to the voting delay.
      *
      * NOTE: This value is stored when the proposal is submitted so that possible changes to the value do not affect
      * proposals that have already been submitted. The type used to save it is a uint32. Consequently, while this
@@ -284,42 +309,28 @@ interface IMerkleGovernor is IERC165, IERC6372 {
     function quorum(uint256 timepoint) external view returns (uint256);
 
     /**
-     * @notice module:reputation
-     * @dev Voting power of an `account` at a specific `timepoint`.
-     *
-     * Note: this can be implemented in a number of ways, for example by reading the delegated balance from one (or
-     * multiple), {ERC20Votes} tokens.
-     */
-    function getVotes(address account, uint256 timepoint) external view returns (uint256);
-
-    /**
-     * @notice module:reputation
-     * @dev Voting power of an `account` at a specific `timepoint` given additional encoded parameters.
-     */
-    function getVotesWithParams(
-        address account,
-        uint256 timepoint,
-        bytes memory params
-    ) external view returns (uint256);
-
-    /**
      * @notice module:voting
      * @dev Returns whether `account` has cast a vote on `proposalId`.
      */
     function hasVoted(uint256 proposalId, address account) external view returns (bool);
 
     /**
-     * @dev Create a new proposal. Vote start after a delay specified by {IGovernor-votingDelay} and lasts for a
+     * @dev Request the creation of a new proposal. Vote start once voter
+     * snapshot merkle root has been approved in the checkpoint oracle and
      * duration specified by {IGovernor-votingPeriod}.
      *
-     * Emits a {ProposalCreated} event.
+     * Emits a {ProposalRequested} event.
      */
-    function propose(
+    function requestProposal(
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
         string memory description
-    ) external returns (uint256 proposalId);
+    )
+        external
+        returns (uint256 proposalId);
+
+    function validateProposal(uint256 proposalId, uint256 proposerVotingPower, bytes32[] calldata proof) external;
 
     /**
      * @dev Queue a proposal. Some governors require this step to be performed before execution can happen. If queuing
@@ -376,7 +387,14 @@ interface IMerkleGovernor is IERC165, IERC6372 {
      *
      * Emits a {VoteCast} event.
      */
-    function castVote(uint256 proposalId, uint8 support) external returns (uint256 balance);
+    function castVote(
+        uint256 proposalId,
+        uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof
+    )
+        external
+        returns (uint256 balance);
 
     /**
      * @dev Cast a vote with a reason
@@ -386,8 +404,12 @@ interface IMerkleGovernor is IERC165, IERC6372 {
     function castVoteWithReason(
         uint256 proposalId,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason
-    ) external returns (uint256 balance);
+    )
+        external
+        returns (uint256 balance);
 
     /**
      * @dev Cast a vote with a reason and additional encoded parameters
@@ -397,9 +419,13 @@ interface IMerkleGovernor is IERC165, IERC6372 {
     function castVoteWithReasonAndParams(
         uint256 proposalId,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason,
         bytes memory params
-    ) external returns (uint256 balance);
+    )
+        external
+        returns (uint256 balance);
 
     /**
      * @dev Cast a vote using the voter's signature, including ERC-1271 signature support.
@@ -410,8 +436,12 @@ interface IMerkleGovernor is IERC165, IERC6372 {
         uint256 proposalId,
         uint8 support,
         address voter,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         bytes memory signature
-    ) external returns (uint256 balance);
+    )
+        external
+        returns (uint256 balance);
 
     /**
      * @dev Cast a vote with a reason and additional encoded parameters using the voter's signature,
@@ -423,8 +453,12 @@ interface IMerkleGovernor is IERC165, IERC6372 {
         uint256 proposalId,
         uint8 support,
         address voter,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason,
         bytes memory params,
         bytes memory signature
-    ) external returns (uint256 balance);
+    )
+        external
+        returns (uint256 balance);
 }

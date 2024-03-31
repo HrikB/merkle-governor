@@ -12,8 +12,10 @@ import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 import { Context } from "@openzeppelin/contracts/utils/Context.sol";
 import { Nonces } from "@openzeppelin/contracts/utils/Nonces.sol";
 import { IERC6372 } from "@openzeppelin/contracts/governance/IGovernor.sol";
+import { MerkleProof } from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 import { IMerkleGovernor } from "./IMerkleGovernor.sol";
+import { ICheckpointOracle } from "./ICheckpointOracle.sol";
 
 /**
  * @dev Core of the governance system, designed to be extended through various modules.
@@ -21,7 +23,6 @@ import { IMerkleGovernor } from "./IMerkleGovernor.sol";
  * This contract is abstract and requires several functions to be implemented in various modules:
  *
  * - A counting module must implement {quorum}, {_quorumReached}, {_voteSucceeded} and {_countVote}
- * - A voting module must implement {_getVotes}
  * - Additionally, {votingPeriod} must also be implemented
  */
 abstract contract MerkleGovernor is
@@ -43,12 +44,17 @@ abstract contract MerkleGovernor is
 
     struct ProposalCore {
         address proposer;
-        uint48 voteStart;
+        uint48 voteSnapshot;
         uint32 voteDuration;
         bool executed;
         bool canceled;
+        bool validated;
         uint48 etaSeconds;
+        uint48 proposalTimepoint;
     }
+
+    ICheckpointOracle internal _checkpointOracle;
+    address private _proposalValidator;
 
     bytes32 private constant ALL_PROPOSAL_STATES_BITMAP = bytes32((2 ** (uint8(type(ProposalState).max) + 1)) - 1);
     string private _name;
@@ -79,8 +85,16 @@ abstract contract MerkleGovernor is
     /**
      * @dev Sets the value for {name} and {version}
      */
-    constructor(string memory name_) EIP712(name_, version()) {
+    constructor(
+        string memory name_,
+        ICheckpointOracle checkpointOracle_,
+        address proposalValidator_
+    )
+        EIP712(name_, version())
+    {
         _name = name_;
+        _checkpointOracle = checkpointOracle_;
+        _proposalValidator = proposalValidator_;
     }
 
     /**
@@ -158,19 +172,20 @@ abstract contract MerkleGovernor is
             return ProposalState.Canceled;
         }
 
-        uint256 snapshot = proposalSnapshot(proposalId);
+        bool proposalValidated = proposal.validated;
 
-        if (snapshot == 0) {
-            revert GovernorNonexistentProposal(proposalId);
+        if (!proposalValidated) {
+            return ProposalState.AwaitingValidation;
+        }
+
+        (bytes32 root,, uint256 approvalTimepoint) = _checkpointOracle.getCheckpoint(proposal.voteSnapshot);
+        if (root == bytes32(0)) {
+            return ProposalState.Pending;
         }
 
         uint256 currentTimepoint = clock();
 
-        if (snapshot >= currentTimepoint) {
-            return ProposalState.Pending;
-        }
-
-        uint256 deadline = proposalDeadline(proposalId);
+        uint256 deadline = approvalTimepoint + _proposals[proposalId].voteDuration;
 
         if (deadline >= currentTimepoint) {
             return ProposalState.Active;
@@ -184,13 +199,6 @@ abstract contract MerkleGovernor is
     }
 
     /**
-     * @dev See {IMerkleGovernor-proposalThreshold}.
-     */
-    function proposalThreshold() public view virtual returns (uint256) {
-        return 0;
-    }
-
-    /**
      * @dev See {IMerkleGovernor-proposalSnapshot}.
      */
     function proposalSnapshot(uint256 proposalId) public view virtual returns (uint256) {
@@ -201,7 +209,12 @@ abstract contract MerkleGovernor is
      * @dev See {IMerkleGovernor-proposalDeadline}.
      */
     function proposalDeadline(uint256 proposalId) public view virtual returns (uint256) {
-        return _proposals[proposalId].voteStart + _proposals[proposalId].voteDuration;
+        (,, uint256 approvalTimepoint) = _checkpointOracle.getCheckpoint(_proposals[proposalId].voteSnapshot);
+
+        // Null value
+        if (approvalTimepoint == 0) return 0;
+
+        return approvalTimepoint + _proposals[proposalId].voteDuration;
     }
 
     /**
@@ -252,11 +265,6 @@ abstract contract MerkleGovernor is
     function _voteSucceeded(uint256 proposalId) internal view virtual returns (bool);
 
     /**
-     * @dev Get the voting weight of `account` at a specific `timepoint`, for a vote as described by `params`.
-     */
-    function _getVotes(address account, uint256 timepoint, bytes memory params) internal view virtual returns (uint256);
-
-    /**
      * @dev Register a vote for `proposalId` by `account` with a given `support`, voting `weight` and voting `params`.
      *
      * Note: Support is generic and can represent various things depending on the voting system used.
@@ -282,14 +290,18 @@ abstract contract MerkleGovernor is
     }
 
     /**
-     * @dev See {IGovernor-propose}. This function has opt-in frontrunning protection, described in {_isValidDescriptionForProposer}.
+     * @dev See {IMerkleGovernor-requestProposal}. This function has opt-in frontrunning protection, described in {_isValidDescriptionForProposer}.
      */
-    function propose(
+    function requestProposal(
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
         string memory description
-    ) public virtual returns (uint256) {
+    )
+        public
+        virtual
+        returns (uint256)
+    {
         address proposer = _msgSender();
 
         // check description restriction
@@ -297,61 +309,85 @@ abstract contract MerkleGovernor is
             revert GovernorRestrictedProposer(proposer);
         }
 
-        // check proposal threshold
-        uint256 proposerVotes = getVotes(proposer, clock() - 1);
-        uint256 votesThreshold = proposalThreshold();
-        if (proposerVotes < votesThreshold) {
-            revert GovernorInsufficientProposerVotes(proposer, proposerVotes, votesThreshold);
-        }
-
-        return _propose(targets, values, calldatas, description, proposer);
+        return _requestProposal(targets, values, calldatas, description, proposer);
     }
 
     /**
      * @dev Internal propose mechanism. Can be overridden to add more logic on proposal creation.
      *
-     * Emits a {IGovernor-ProposalCreated} event.
+     * Emits a {IMerkleGovernor-ProposalRequested} event.
      */
-    function _propose(
+    function _requestProposal(
         address[] memory targets,
         uint256[] memory values,
         bytes[] memory calldatas,
         string memory description,
         address proposer
-    ) internal virtual returns (uint256 proposalId) {
+    )
+        internal
+        virtual
+        returns (uint256 proposalId)
+    {
         proposalId = hashProposal(targets, values, calldatas, keccak256(bytes(description)));
 
         if (targets.length != values.length || targets.length != calldatas.length || targets.length == 0) {
             revert GovernorInvalidProposalLength(targets.length, calldatas.length, values.length);
         }
-        if (_proposals[proposalId].voteStart != 0) {
+        if (_proposals[proposalId].voteSnapshot != 0) {
             revert GovernorUnexpectedProposalState(proposalId, state(proposalId), bytes32(0));
         }
 
-        uint256 snapshot = clock() + votingDelay();
+        uint256 snapshot = clock() + snapshotDelay();
         uint256 duration = votingPeriod();
 
         ProposalCore storage proposal = _proposals[proposalId];
         proposal.proposer = proposer;
-        proposal.voteStart = SafeCast.toUint48(snapshot);
+        proposal.voteSnapshot = SafeCast.toUint48(snapshot);
         proposal.voteDuration = SafeCast.toUint32(duration);
+        proposal.proposalTimepoint = SafeCast.toUint48(clock() - 1);
 
-        emit ProposalCreated(
-            proposalId,
-            proposer,
-            targets,
-            values,
-            new string[](targets.length),
-            calldatas,
-            snapshot,
-            snapshot + duration,
-            description
+        emit ProposalRequested(
+            proposalId, proposer, targets, values, new string[](targets.length), calldatas, snapshot, description
         );
 
         // Using a named return variable to avoid stack too deep errors
     }
 
     /**
+     * @dev Callback function used by centralized party to validate a proposal.
+     * Gas is subsidized by the centralized party.
+     */
+    function validateProposal(
+        uint256 proposalId,
+        uint256 proposerVotingPower,
+        bytes32[] calldata proof
+    )
+        public
+        virtual
+    {
+        if (_msgSender() != _proposalValidator) revert GovernorOnlyProposalValidator(_msgSender());
+        _validateStateBitmap(proposalId, _encodeStateBitmap(ProposalState.AwaitingValidation));
+
+        ProposalCore storage proposal = _proposals[proposalId];
+        uint48 proposalTimepoint = proposal.proposalTimepoint;
+
+        (bytes32 merkleRoot,,) = _checkpointOracle.getCheckpoint(proposalTimepoint);
+
+        if (merkleRoot == bytes32(0)) revert GovernorCheckpointNotYetApproved();
+
+        address proposer = proposal.proposer;
+
+        bytes32 leafNode = _efficientHash(proposer, proposerVotingPower);
+
+        if (!MerkleProof.verifyCalldata(proof, merkleRoot, leafNode)) {
+            _cancel(proposalId);
+            return;
+        }
+
+        proposal.validated = true;
+        emit ProposalValidated(proposalId);
+    }
+
     /**
      * @dev See {IMerkleGovernor-queue}.
      */
@@ -520,44 +556,37 @@ abstract contract MerkleGovernor is
     {
         uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
 
+        _cancel(proposalId);
+
+        return proposalId;
+    }
+
+    function _cancel(uint256 proposalId) internal virtual {
         _validateStateBitmap(
             proposalId,
-            ALL_PROPOSAL_STATES_BITMAP ^
-                _encodeStateBitmap(ProposalState.Canceled) ^
-                _encodeStateBitmap(ProposalState.Expired) ^
-                _encodeStateBitmap(ProposalState.Executed)
+            ALL_PROPOSAL_STATES_BITMAP ^ _encodeStateBitmap(ProposalState.Canceled)
+                ^ _encodeStateBitmap(ProposalState.Expired) ^ _encodeStateBitmap(ProposalState.Executed)
         );
 
         _proposals[proposalId].canceled = true;
         emit ProposalCanceled(proposalId);
-
-        return proposalId;
     }
 
     /**
      * @dev See {IMerkleGovernor-castVote}.
      */
-    function getVotes(address account, uint256 timepoint) public view virtual returns (uint256) {
-        return _getVotes(account, timepoint, _defaultParams());
-    }
-
-    /**
-     * @dev See {IGovernor-getVotesWithParams}.
-     */
-    function getVotesWithParams(
-        address account,
-        uint256 timepoint,
-        bytes memory params
-    ) public view virtual returns (uint256) {
-        return _getVotes(account, timepoint, params);
-    }
-
-    /**
-     * @dev See {IGovernor-castVote}.
-     */
-    function castVote(uint256 proposalId, uint8 support) public virtual returns (uint256) {
+    function castVote(
+        uint256 proposalId,
+        uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof
+    )
+        public
+        virtual
+        returns (uint256)
+    {
         address voter = _msgSender();
-        return _castVote(proposalId, voter, support, "");
+        return _castVote(proposalId, voter, support, votingPower, proof, "");
     }
 
     /**
@@ -566,10 +595,16 @@ abstract contract MerkleGovernor is
     function castVoteWithReason(
         uint256 proposalId,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason
-    ) public virtual returns (uint256) {
+    )
+        public
+        virtual
+        returns (uint256)
+    {
         address voter = _msgSender();
-        return _castVote(proposalId, voter, support, reason);
+        return _castVote(proposalId, voter, support, votingPower, proof, reason);
     }
 
     /**
@@ -578,11 +613,17 @@ abstract contract MerkleGovernor is
     function castVoteWithReasonAndParams(
         uint256 proposalId,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason,
         bytes memory params
-    ) public virtual returns (uint256) {
+    )
+        public
+        virtual
+        returns (uint256)
+    {
         address voter = _msgSender();
-        return _castVote(proposalId, voter, support, reason, params);
+        return _castVote(proposalId, voter, support, votingPower, proof, reason, params);
     }
 
     /**
@@ -592,8 +633,14 @@ abstract contract MerkleGovernor is
         uint256 proposalId,
         uint8 support,
         address voter,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         bytes memory signature
-    ) public virtual returns (uint256) {
+    )
+        public
+        virtual
+        returns (uint256)
+    {
         bool valid = SignatureChecker.isValidSignatureNow(
             voter,
             _hashTypedDataV4(keccak256(abi.encode(BALLOT_TYPEHASH, proposalId, support, voter, _useNonce(voter)))),
@@ -604,7 +651,7 @@ abstract contract MerkleGovernor is
             revert GovernorInvalidSignature(voter);
         }
 
-        return _castVote(proposalId, voter, support, "");
+        return _castVote(proposalId, voter, support, votingPower, proof, "");
     }
 
     /**
@@ -614,75 +661,96 @@ abstract contract MerkleGovernor is
         uint256 proposalId,
         uint8 support,
         address voter,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string calldata reason,
         bytes memory params,
         bytes memory signature
-    ) public virtual returns (uint256) {
-        bool valid = SignatureChecker.isValidSignatureNow(
+    )
+        public
+        virtual
+        returns (uint256)
+    {
+        bytes memory payload = abi.encode(
+            EXTENDED_BALLOT_TYPEHASH,
+            proposalId,
+            support,
             voter,
-            _hashTypedDataV4(
-                keccak256(
-                    abi.encode(
-                        EXTENDED_BALLOT_TYPEHASH,
-                        proposalId,
-                        support,
-                        voter,
-                        _useNonce(voter),
-                        keccak256(bytes(reason)),
-                        keccak256(params)
-                    )
-                )
-            ),
-            signature
+            _useNonce(voter),
+            keccak256(bytes(reason)),
+            keccak256(params)
         );
+
+        bool valid = SignatureChecker.isValidSignatureNow(voter, _hashTypedDataV4(keccak256(payload)), signature);
 
         if (!valid) {
             revert GovernorInvalidSignature(voter);
         }
 
-        return _castVote(proposalId, voter, support, reason, params);
+        return _castVote(proposalId, voter, support, votingPower, proof, reason, params);
     }
 
     /**
-     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
-     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function. Uses the _defaultParams().
+     * @dev Internal vote casting mechanism: Check that the vote is pending,
+     * that it has not been cast yet. Voting weight will provided by user and
+     * will be proven to be valid using a merkle proof. Then, call the
+     * {_countVote} internal function. Uses the _defaultParams().
      *
-     * Emits a {IGovernor-VoteCast} event.
+     * Emits a {IMerkleGovernor-VoteCast} event.
      */
     function _castVote(
         uint256 proposalId,
         address account,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string memory reason
-    ) internal virtual returns (uint256) {
-        return _castVote(proposalId, account, support, reason, _defaultParams());
+    )
+        internal
+        virtual
+        returns (uint256)
+    {
+        return _castVote(proposalId, account, support, votingPower, proof, reason, _defaultParams());
     }
 
     /**
-     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
-     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function.
+     * @dev Internal vote casting mechanism: Check that the vote is pending,
+     * that it has not been cast yet. Voting weight will provided by user and
+     * will be proven to be valid using a merkle proof. Then, call the
+     * {_countVote} internal function. Uses the _defaultParams().
      *
-     * Emits a {IGovernor-VoteCast} event.
+     * Emits a {IMerkleGovernor-VoteCast} event.
      */
     function _castVote(
         uint256 proposalId,
         address account,
         uint8 support,
+        uint256 votingPower,
+        bytes32[] calldata proof,
         string memory reason,
         bytes memory params
-    ) internal virtual returns (uint256) {
+    )
+        internal
+        virtual
+        returns (uint256)
+    {
         _validateStateBitmap(proposalId, _encodeStateBitmap(ProposalState.Active));
 
-        uint256 weight = _getVotes(account, proposalSnapshot(proposalId), params);
-        _countVote(proposalId, account, support, weight, params);
+        (bytes32 root,,) = _checkpointOracle.getCheckpoint(_proposals[proposalId].voteSnapshot);
+
+        bytes32 leafNode = _efficientHash(_msgSender(), votingPower);
+        if (!MerkleProof.verifyCalldata(proof, root, leafNode)) {
+            revert GovernorInvalidVoterProof(_msgSender(), votingPower);
+        }
+        _countVote(proposalId, account, support, votingPower, params);
 
         if (params.length == 0) {
-            emit VoteCast(account, proposalId, support, weight, reason);
+            emit VoteCast(account, proposalId, support, votingPower, reason);
         } else {
-            emit VoteCastWithParams(account, proposalId, support, weight, reason, params);
+            emit VoteCastWithParams(account, proposalId, support, votingPower, reason, params);
         }
 
-        return weight;
+        return votingPower;
     }
 
     /**
@@ -868,6 +936,18 @@ abstract contract MerkleGovernor is
     }
 
     /**
+     * @dev Same as keccak256(abi.encodePacked(a, b))
+     */
+    function _efficientHash(address a, uint256 b) private pure returns (bytes32 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            result := keccak256(0x0c, 0x34)
+        }
+    }
+
+    /**
      * @inheritdoc IERC6372
      */
     function clock() public view virtual returns (uint48);
@@ -881,7 +961,7 @@ abstract contract MerkleGovernor is
     /**
      * @inheritdoc IMerkleGovernor
      */
-    function votingDelay() public view virtual returns (uint256);
+    function snapshotDelay() public view virtual returns (uint256);
 
     /**
      * @inheritdoc IMerkleGovernor
